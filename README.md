@@ -56,25 +56,56 @@ Cache trouble degrades to Postgres instead of failing the read. A failed `SET` d
 
 Keys are `<table>:<id>` (e.g. `products:p1`, `orders:o1`), derived from the change event itself. Watching a new table needs no code change — add it to `TABLES` (plus a one-time `ALTER PUBLICATION my_publication ADD TABLE <table>;`).
 
-## Quick start
+## Setup
 
-Requirements: Postgres with `wal_level = logical`, and Redis or Valkey on `localhost:6379`.
+Postgres needs logical replication; the app needs a database, a watched table, and a cache.
 
 ```sh
-# from the repo root
+# 1. Start Postgres (this repo's dev cluster lives at ~/pgdata)
+pg_ctl -D ~/pgdata -l ~/pgdata/logfile \
+  -o "-k /home/uthman/pgdata -c listen_addresses=localhost" start
+
+# 2. One-time DB config, as superuser (wal_level needs a restart to take effect)
+psql -h localhost -U postgres -d postgres \
+  -c "ALTER SYSTEM SET wal_level = logical;" \
+  -c "CREATE DATABASE redis_cdc;"
+# restart, then:
+psql -h localhost -U postgres -d redis_cdc \
+  -c "CREATE TABLE IF NOT EXISTS products (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+
+# 3. Start Valkey (or Redis) on 6379
+valkey-server --daemonize yes --save '' --appendonly no
+
+# 4. Run the watcher (phylax creates its slot + publication itself)
 DATABASE_URL='postgres://postgres@localhost:5432/redis_cdc' go run .
 ```
 
-This starts the WAL watcher plus a console at `http://localhost:8080/dashboard` (KPIs, lag sparkline, live change feed, with `/metrics/stream` and `/events` alongside).
+Adding another table later is two steps, no code change:
 
-Now write a row from anywhere — psql, your app, a script:
+```sql
+CREATE TABLE orders (id TEXT PRIMARY KEY, item TEXT NOT NULL);
+ALTER PUBLICATION my_publication ADD TABLE orders;
+```
+
+```sh
+TABLES='products,orders' DATABASE_URL='...' go run .
+```
+
+## Quick start
+
+With setup done, the console lives at `http://localhost:8080/dashboard` (KPIs, lag sparkline, live change feed, with `/metrics/stream` and `/events` alongside).
+
+Write a row from anywhere — psql, your app, a script:
 
 ```sql
 INSERT INTO products (id, name) VALUES ('demo1', 'apple');
 UPDATE products SET name = 'APPLE' WHERE id = 'demo1';
 ```
 
-The app logs each invalidation with its worker, e.g. `invalidated products:demo1 pool=5 (insert)` — same key, same pool every time — and the dashboard's `changes_processed` ticks up per write.
+The dashboard's `changes_processed` ticks up once per write, and the next `getProduct("demo1")` repopulates Redis from Postgres. (Per-key log lines were removed after load testing showed `fmt.Printf` at flood rates cost more than the `DEL` itself — flow is visible in the console instead.)
 
 ## Configuration
 
@@ -92,9 +123,30 @@ The app logs each invalidation with its worker, e.g. `invalidated products:demo1
 `cdcStream` supervises replication and the console as one unit: either side dying takes the other down, and Ctrl-C shuts both down gracefully. While running, watch:
 
 - `changes_processed` — should tick once per committed row change; compare against your write rate.
-- `changes_dropped` — must stay 0; drops mean a subscriber can't keep up.
+- `changes_dropped` — must stay 0; drops mean a subscriber can't keep up (see Benchmarks for the one time it didn't).
 - `replication_lag_bytes` — a plateau during writes is pipeline depth; a climb means the consumer is falling behind; check `pg_replication_slots` on Postgres if it grows while this app is stopped.
-- App log lines — every invalidation prints its key, pool, and operation, so the sharding is visible, not trusted.
+- Error log — only invalidation failures are logged; the hot path is silent by design.
+
+## Benchmarks
+
+Load-tested with [barrage](https://github.com/codetesla51/barrage): `db:` runners firing `INSERT ... ON CONFLICT DO UPDATE` at Postgres (each write generates one WAL change → one `DEL`), watching the console counters. barrage `concurrency` doubles as its DB pool size; Postgres `max_connections = 100`.
+
+| Run | Writes | Success | Rate | P99 | CDC processed | CDC dropped |
+|---|---|---|---|---|---|---|
+| 8 hot keys, 500/s | 13,749 | 76.9% | 458/s | 816ms | +10,570 | 0 |
+| 500 keys, 2000/s | 55,002 | 100% | 1,833/s | 87ms | +55k | 0 |
+| 500 keys, 2000/s | 55,005 | 93.7% | 1,833/s | 130ms | +51k | 330 |
+| 500 keys, 2000/s, buffer 5000 | 54,997 | 93.3% | 1,833/s | 129ms | +51k | 0 |
+| 500 keys, 2000/s | 54,984 | 47.1% | 1,833/s | 202ms | +26k | 0 |
+| 500 keys, 2000/s, 10 min | 1,189,998 | 100% | 1,983/s | 103ms | +1.19M | 0 |
+
+What the runs taught (each finding verified by rerun, not assumed):
+
+- **Row-lock queues, not CDC.** The 8-key run's 816ms P99 was 50 workers queuing on 8 rows — Postgres contention from the key choice, while CDC stayed clean. Wide keys measure the pipeline; hot keys measure locks.
+- **Success-rate variance is the tool's pool.** Identical configs scored 100% / 93% / 47% with zero Postgres errors; Little's law (≈2000/s × 37ms ≈ 74 conns vs barrage's 80-conn pool) says the generator starved itself. The 76.9% run's failures were all end-of-run shutdown cancels in the PG log.
+- **The dashboard tab drops.** 25k drops in one run traced to a Firefox tab on the console: its `/events` feed (10-deep buffer) can't drink a 1.8k/s firehose, so phylax dropped *its* copies. The invalidator never missed one — drop-on-full protecting the stream, exactly as designed. Close the tab for clean numbers.
+- **The 100-deep buffer clips bursts.** 330 drops (0.6%) at 1.8k/s with one subscriber. Removing per-key logging changed nothing (156 → 330), disproving the first theory — burst depth, not consumer speed, was the cause. Fix: `CHANGE_BUFFER_SIZE=5000` (phylax `v0.3.3`, ~1KB per change) → drops 0 on reflood.
+- **Sustained proof.** 10 minutes, 1.19M writes, 100% success, P99 103ms, zero drops, slot lag drained to idle. The pipeline holds.
 
 ## Tests
 
