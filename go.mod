@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/alitto/pond/v2 v2.7.1
-	github.com/codetesla51/phylax v0.3.2
+	github.com/codetesla51/phylax v0.3.3
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/redis/go-redis/v9 v9.22.0
 )

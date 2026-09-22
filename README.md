@@ -85,6 +85,7 @@ The app logs each invalidation with its worker, e.g. `invalidated products:demo1
 | `REDIS_ADDR` | `localhost:6379` | Redis/Valkey address. Pinged at startup — fail fast if unreachable. |
 | `HTTP_ADDR` | `:8080` | Console address. |
 | `WORKER_POOLS` | `8` | Router pool count. Must be a positive int; anything else is a startup error. Pools hold no state, so changing this across a restart loses and reorders nothing. |
+| `CHANGE_BUFFER_SIZE` | `100` | Per-subscriber WAL change buffer (phylax `v0.3.3+`). Size for the biggest burst (~1KB per change); a full buffer drops rather than stalls. |
 
 ## Monitoring
 

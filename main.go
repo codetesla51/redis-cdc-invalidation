@@ -34,8 +34,16 @@ func main() {
 		}
 		pools = n
 	}
+	changeBuf := 0 // 0 = phylax default (100); each buffered change ≈ 1KB
+	if v := os.Getenv("CHANGE_BUFFER_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			log.Fatalf("CHANGE_BUFFER_SIZE must be a positive int, got %q", v)
+		}
+		changeBuf = n
+	}
 
-	if err := run(context.Background(), dsn, redisAddr, httpAddr, tables, pools); err != nil {
+	if err := run(context.Background(), dsn, redisAddr, httpAddr, tables, pools, changeBuf); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -56,7 +64,7 @@ func parseTables(v string) []string {
 }
 
 // run starts the phylax watcher plus its console, or no-ops when DSN is empty.
-func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, pools int) error {
+func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, pools, changeBuf int) error {
 	router := NewRouter(pools)
 	defer router.StopAndWait()
 
@@ -75,8 +83,9 @@ func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, 
 	defer stop()
 
 	cdc, err := phylax.New(phylax.Config{
-		DSN:    dsn,
-		Tables: tables,
+		DSN:              dsn,
+		Tables:           tables,
+		ChangeBufferSize: changeBuf,
 	})
 	if err != nil {
 		return err
@@ -84,13 +93,13 @@ func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, 
 
 	cdc.OnChange(func(c *phylax.Change) {
 		id := rowID(c)
-		pool := router.Owner(id)
 		router.Dispatch(id, func() {
+			// No per-key logging here: at flood rates, formatting stdout per
+			// DEL is the slowest stage and overflows the change buffer.
+			// Flow is visible via the console (changes_processed) instead.
 			if err := invalidateProduct(context.Background(), rdb, c.Table, id); err != nil {
 				log.Printf("invalidate %s: %v", cacheKey(c.Table, id), err)
-				return
 			}
-			fmt.Printf("invalidated %s pool=%d (%s)\n", cacheKey(c.Table, id), pool, c.Operation)
 		})
 	})
 
