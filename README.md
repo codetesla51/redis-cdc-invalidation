@@ -148,6 +148,14 @@ What the runs taught (each finding verified by rerun, not assumed):
 - **The 100-deep buffer clips bursts.** 330 drops (0.6%) at 1.8k/s with one subscriber. Removing per-key logging changed nothing (156 → 330), disproving the first theory — burst depth, not consumer speed, was the cause. Fix: `CHANGE_BUFFER_SIZE=5000` (phylax `v0.3.3`, ~1KB per change) → drops 0 on reflood.
 - **Sustained proof.** 10 minutes, 1.19M writes, 100% success, P99 103ms, zero drops, slot lag drained to idle. The pipeline holds.
 
+### Invalidation lag
+
+Measured directly: 200 iterations of seed-stale-key → `UPDATE` → poll `EXISTS` until gone, client-side on localhost against the idle stack:
+
+`min 6.7ms · p50 7.5ms · p95 12.1ms · p99 13.0ms · max 16.5ms`
+
+That window covers commit + WAL + hash route + `DEL` (plus ~1ms of client round trip, so true commit→DEL is slightly under). Reads inside it can serve the pre-write value — if a path needs read-your-write, invalidate inline there alongside CDC.
+
 ## Tests
 
 ```sh
