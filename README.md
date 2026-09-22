@@ -138,7 +138,7 @@ Load-tested with [barrage](https://github.com/codetesla51/barrage): `db:` runner
 | 500 keys, 2000/s | 55,005 | 93.7% | 1,833/s | 130ms | +51k | 330 |
 | 500 keys, 2000/s, buffer 5000 | 54,997 | 93.3% | 1,833/s | 129ms | +51k | 0 |
 | 500 keys, 2000/s | 54,984 | 47.1% | 1,833/s | 202ms | +26k | 0 |
-| 500 keys, 2000/s, 10 min | 1,189,998 | 100% | 1,983/s | 103ms | +1.19M | 0 |
+| 500 keys, 2000/s, 10 min, buffer 5000 | 1,189,998 | 100% | 1,983/s | 103ms | +1.19M | 0 |
 
 What the runs taught (each finding verified by rerun, not assumed):
 
@@ -146,7 +146,7 @@ What the runs taught (each finding verified by rerun, not assumed):
 - **Success-rate variance is the tool's pool.** Identical configs scored 100% / 93% / 47% with zero Postgres errors; Little's law (≈2000/s × 37ms ≈ 74 conns vs barrage's 80-conn pool) says the generator starved itself. The 76.9% run's failures were all end-of-run shutdown cancels in the PG log.
 - **The dashboard tab drops.** 25k drops in one run traced to a Firefox tab on the console: its `/events` feed (10-deep buffer) can't drink a 1.8k/s firehose, so phylax dropped *its* copies. The invalidator never missed one — drop-on-full protecting the stream, exactly as designed. Close the tab for clean numbers.
 - **The 100-deep buffer clips bursts.** 330 drops (0.6%) at 1.8k/s with one subscriber. Removing per-key logging changed nothing (156 → 330), disproving the first theory — burst depth, not consumer speed, was the cause. Fix: `CHANGE_BUFFER_SIZE=5000` (phylax `v0.3.3`, ~1KB per change) → drops 0 on reflood.
-- **Sustained proof.** 10 minutes, 1.19M writes, 100% success, P99 103ms, zero drops, slot lag drained to idle. The pipeline holds.
+- **Sustained proof.** 10 minutes, 1.19M writes, 100% success, P99 103ms, zero drops, slot lag drained to idle — run with `CHANGE_BUFFER_SIZE=5000` (`WORKER_POOLS=8`, `TABLES=products`). The pipeline holds.
 
 ### Invalidation lag
 
