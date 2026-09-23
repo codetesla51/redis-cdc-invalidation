@@ -118,6 +118,22 @@ The dashboard's `changes_processed` ticks up once per write, and the next `getPr
 | `HTTP_ADDR` | `:8080` | Console address. |
 | `WORKER_POOLS` | `8` | Router pool count. Must be a positive int; anything else is a startup error. Pools hold no state, so changing this across a restart loses and reorders nothing. |
 | `CHANGE_BUFFER_SIZE` | `100` | Per-subscriber WAL change buffer (phylax `v0.3.3+`). Size for the biggest burst (~1KB per change); a full buffer drops rather than stalls. |
+| `MODE` | `direct` | Topology: `direct` (phylax straight to pools), `produce` (phylax appends to `STREAM`), `consume` (group worker drains `STREAM` into `DEL`s). |
+| `STREAM` | `cdc` | Stream key for produce/consume modes. |
+| `GROUP` | `invalidators` | Consumer group workers share; each entry delivered to exactly one worker, `ACK`ed only after its `DEL`. |
+
+## Scaling out with streams
+
+One slot serves one consumer, so plain `direct` mode can't share load: three boxes would each eat every change. `MODE=produce` turns phylax into a stream producer (`XADD cdc * table op id` per change); any number of `MODE=consume` boxes in `GROUP` split the entries (`XREADGROUP`), `DEL`, `XACK`. Unacked entries stay pending for redelivery — at-least-once without the slot. Out-of-order delivery across consumers is harmless: `DEL` is idempotent.
+
+```sh
+# box 1: WAL → stream
+DATABASE_URL='...' TABLES='products' MODE=produce /tmp/opencode/cdc-load
+# boxes 2..N: stream → DEL
+MODE=consume /tmp/opencode/cdc-load
+```
+
+Proven live: one insert → key gone, group backlog empty.
 
 ## Monitoring
 

@@ -25,6 +25,12 @@ type Config struct {
 	Tables    []string
 	Pools     int
 	ChangeBuf int // 0 = phylax default (100); each buffered change ≈ 1KB
+	// Mode selects the topology: direct (phylax straight to pools),
+	// produce (phylax appends to Stream), consume (group worker drains
+	// Stream into DELs). Stream/Group matter only off direct.
+	Mode   string
+	Stream string
+	Group  string
 }
 
 func main() {
@@ -35,6 +41,9 @@ func main() {
 		Tables:    parseTables(os.Getenv("TABLES")),
 		Pools:     positiveEnv("WORKER_POOLS", 8),
 		ChangeBuf: positiveEnv("CHANGE_BUFFER_SIZE", 0),
+		Mode:      envOr("MODE", "direct"),
+		Stream:    envOr("STREAM", "cdc"),
+		Group:     envOr("GROUP", "invalidators"),
 	}
 	if err := run(context.Background(), cfg); err != nil {
 		log.Fatal(err)
@@ -76,16 +85,28 @@ func parseTables(v string) []string {
 	return tables
 }
 
-// run starts the phylax watcher plus its console, or no-ops when DSN is empty.
+// run starts the topology named by cfg.Mode, or no-ops when DSN is empty
+// (consume mode needs no database). Unknown modes are fatal.
 func run(ctx context.Context, cfg Config) error {
-	router := NewRouter(cfg.Pools)
-	defer router.StopAndWait()
-
 	rdb := newRedisClient(cfg.RedisAddr)
 	defer rdb.Close()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("redis ping %s: %w", cfg.RedisAddr, err)
 	}
+
+	switch cfg.Mode {
+	case "consume":
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runConsumer(ctx, rdb, cfg.Stream, cfg.Group)
+	case "direct", "produce":
+		break
+	default:
+		return fmt.Errorf("unknown MODE %q: want direct, produce, or consume", cfg.Mode)
+	}
+
+	router := NewRouter(cfg.Pools)
+	defer router.StopAndWait()
 
 	if cfg.DSN == "" {
 		fmt.Println("phylax DSN empty, skipping Start")
@@ -105,6 +126,14 @@ func run(ctx context.Context, cfg Config) error {
 	}
 
 	cdc.OnChange(func(c *phylax.Change) {
+		// Produce mode fans out through the stream (many boxes share the
+		// load); direct mode keeps the original straight-to-pool path.
+		if cfg.Mode == "produce" {
+			if err := publishChange(context.Background(), rdb, cfg.Stream, c); err != nil {
+				log.Printf("publish %s %s: %v", c.Operation, c.Table, err)
+			}
+			return
+		}
 		id, ok := rowID(c)
 		if !ok {
 			log.Printf("skip %s %s without row id", c.Operation, c.Table)
