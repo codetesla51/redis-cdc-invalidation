@@ -1,7 +1,7 @@
 duration: 30s
 bucket_width: 1s
 ramp: 5s
-concurrency: 80
+concurrency: 150
 db:
   rate: 2000
   target:
