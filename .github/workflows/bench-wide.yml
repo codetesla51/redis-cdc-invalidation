@@ -3,6 +3,10 @@
 name: Bench-wide
 on:
   workflow_dispatch:
+    inputs:
+      rate:
+        description: 'DB writes/sec target'
+        default: '2000'
 
 jobs:
   flood:
@@ -51,6 +55,7 @@ jobs:
         run: |
           sed -e 's#postgres://postgres@localhost#postgres://postgres:postgres@localhost#' \
               -e 's/^duration:.*/duration: 60s/' \
+              -e 's/^  rate:.*/  rate: ${{ inputs.rate }}/' \
             benchmarks/flood-10k.yaml > /tmp/flood-10k-ci.yaml
           ~/.local/bin/barrage run -c /tmp/flood-10k-ci.yaml \
             --json bench-10k.json --report report-10k.html 2>&1 | tail -n 3
