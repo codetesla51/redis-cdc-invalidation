@@ -44,8 +44,9 @@ Each stage exists for a specific reason:
 `getProduct` checks Redis first. On a miss (or corrupt entry, or Redis being down) it reads Postgres and repopulates Redis:
 
 ```go
-p, err := getProduct(ctx, rdb, pool, "p1")
-if errors.Is(err, ErrProductNotFound) {
+store := NewStore(rdb, pool)
+data, err := store.Get(ctx, "products", "p1") // row JSON; any table with an `id` column
+if errors.Is(err, ErrNotFound) {
     // id exists in neither cache nor Postgres; misses are never cached
 }
 ```
@@ -197,5 +198,5 @@ Pure unit tests (hash stability, cross-key spread, same-key ordering under `-rac
 | `main.go` | Wiring: env config, phylax watcher, supervised console, `rowID` extraction |
 | `router.go` | Hash dispatch to N single-worker pools (`Owner`, `Dispatch`, `StopAndWait`) |
 | `cache.go` | Redis client, `<table>:<id>` keys, idempotent `DEL` |
-| `store.go` | Cache-aside `getProduct`, TTL backstop, `ErrProductNotFound` |
+| `store.go` | Table-agnostic cache-aside `Store.Get`, `singleflight` stampede guard, `ErrNotFound` |
 | `router_test.go`, `cache_test.go`, `store_test.go` | Unit + live tests (live ones skip without local PG/Redis) |
