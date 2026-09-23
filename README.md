@@ -10,30 +10,51 @@ This project flips the responsibility: instead of every writer notifying the cac
 
 ## How it works
 
-The diagram shows the stream path, which is the horizontally scalable shape:
-
 ```mermaid
 flowchart LR
-    subgraph Writers["Any writer"]
+    subgraph WRITERS["Any writer"]
+        direction TB
         API[API layer]
         ADMIN[Admin panel]
         SCRIPT[Scripts / imports]
     end
 
-    Writers --> PG[(Postgres\nsource of truth)]
-    PG -->|WAL + logical slot| PH[phylax\nproducer]
-    PH -->|batched XADD| STREAM[(Redis Stream\ncdc)]
-    STREAM -->|XREADGROUP| GROUP[consumer group\ninvalidators]
-    GROUP -->|DEL + XACK| REDIS[(Redis cache)]
+    WRITERS --> PG[(Postgres\nsource of truth)]
+    PG --> SLOT[Logical replication slot\nmy_slot]
 
-    READS[cache-aside reads] -->|hit| REDIS
-    READS -->|miss| PG
-    PG -->|populate| REDIS
+    subgraph DIRECT["MODE=direct: same process"]
+        direction LR
+        DH[phylax\nOnChange handler] --> ROUTER{hash router\nfnv32a row id % N}
+        ROUTER --> POOL[N pond pools\n1 worker each]
+        POOL --> DDEL[DEL table:id]
+    end
+
+    subgraph STREAMED["MODE=produce + MODE=consume: separate processes"]
+        direction LR
+        PROD[phylax producer] --> QUEUE[bounded queue\nPUBLISH_QUEUE_SIZE]
+        QUEUE -->|10 ms pipeline\nup to 5,000 XADD| STREAM[(Redis Stream\ncdc)]
+        STREAM -->|XREADGROUP\ncount 100, block 5 s| GROUP[GROUP=invalidators]
+        GROUP --> C1[consumer]
+        GROUP --> C2[consumer]
+        GROUP --> CN[consumer]
+        C1 & C2 & CN --> SDEL[DEL table:id\nthen XACK]
+    end
+
+    SLOT --> DH
+    SLOT --> PROD
+    DDEL --> REDIS[(Redis cache)]
+    SDEL --> REDIS
+
+    READS[cache-aside app] -->|GET table:id| REDIS
+    REDIS -->|hit| READS
+    REDIS -->|miss| READS
+    READS -->|SELECT row| PG
+    READS -->|SET row JSON\nTTL 5 minutes| REDIS
 ```
 
-`MODE=direct` is the single-process variant: phylax calls `OnChange`, hashes the row ID into an ordered worker shard, and the shard issues `DEL` directly. Stream mode adds the Redis handoff so multiple consumer processes can split the invalidation work.
+Choose one invalidation path per deployment. In `direct` mode, phylax runs hash routing and invalidation in the same process. In stream mode, `MODE=produce` turns WAL events into stream records, while one or more independent `MODE=consume` processes share the consumer group and invalidate separately.
 
-`Write → Postgres commits → phylax reads WAL → stream or router → DEL the key → next read repopulates from Postgres`
+`Write → Postgres commits → WAL event → stream or router → DEL the key → next read repopulates from Postgres`
 
 Each stage exists for a specific reason:
 
@@ -41,6 +62,9 @@ Each stage exists for a specific reason:
 - **Replication slot (not a plain connection).** The slot (`my_slot`) forces Postgres to retain WAL until this app acknowledges it. If the app restarts, it resumes where it left off. Without the slot, downtime means silently missed writes.
 - **[phylax](https://github.com/codetesla51/phylax) (not hand-rolled replication).** Logical replication's sharp edges — slot/publication lifecycle, keepalives, standby-status timing, reconnect with backoff, LSN resume — are handled by the library. The app implements one callback: `OnChange`.
 - **Hash router (not random dispatch).** `pool = fnv32a(id) % N` sends every change for one row ID to the same pool, so per-key order is preserved, while different IDs scatter across pools for parallelism. Same trick as Kafka partition keys. FNV because it needs to be fast and deterministic, not cryptographic.
+- **Producer queue (stream mode).** `MODE=produce` skips the router and sends each row-bearing WAL event to a bounded publisher queue. Flushes happen every 10 ms as one Redis pipeline, up to 5,000 `XADD`s per flush; if the queue is full, the overflow is logged instead of blocking WAL handling.
+- **Redis Stream handoff (stream mode).** The stream preserves append order and is capped with an approximate maximum length of 100,000 entries, so an inactive consumer group cannot grow it without bound.
+- **Consumer group (stream mode).** Each `MODE=consume` process joins `GROUP`, reads new entries with `XREADGROUP`, deletes the corresponding cache key, then acknowledges the entry. Unacknowledged entries remain pending and can be redelivered, giving at-least-once delivery; malformed entries are left unacknowledged for inspection.
 - **One worker per pool (not a shared thread pool).** Each pond pool runs a single task at a time, so two rapid updates to the same row invalidate in commit order. Raise a pool to 2+ workers and an older state can win the race — the design collapses to "usually correct," which is broken. Across pools, all N run concurrently.
 - **`DEL` (not recompute).** Delete-then-lazy-repopulate is one Redis round trip with no serialization code to rot, and it is idempotent — replayed WAL events are harmless. Recompute only pays off for keys so hot a cold miss hurts; measure before switching.
 - **TTL backstop (not the primary path).** Cached rows expire after 5 minutes, so even a missed `DEL` self-heals. `DEL` does the real work; TTL bounds the worst case. Belt and suspenders: a no-op `DEL` costs ~165µs (measured), so deletes fire on every write without thinking — and if one is ever missed, dropped, or a key is written while the watcher is down, the TTL deletes it late instead of never. Nothing stays stale forever unless *both* fail at once.
