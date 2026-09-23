@@ -148,7 +148,7 @@ Pure unit tests (hash stability, cross-key spread, same-key ordering under `-rac
 - **Lag is inherent, not zero.** Commit → WAL → handler → Redis is milliseconds. If a path needs read-your-write, add a targeted inline invalidation there alongside CDC.
 - **`REPLICA IDENTITY`.** With the default, Postgres ships old-row data only for primary-key changes. Deletes and key updates work; if you ever need old non-key values (e.g. "invalidate the old category listing too"), set `REPLICA IDENTITY FULL` and accept the extra WAL.
 - **Slot lag.** While this process is stopped, WAL accumulates in `my_slot`. Alert on slot growth, or restarts replay a mountain.
-- **Hot keys.** After `DEL` on a very hot key, concurrent reads can stampede Postgres to repopulate. Mitigate with `singleflight` at the read path if you measure it.
+- **Hot keys.** After `DEL` on a very hot key, concurrent reads can stampede Postgres to repopulate. `singleflight` in `Store.Get` already collapses same-key misses into one flight (measured: 30-reader wall 50ms → 7.6ms); if a key outgrows even that, shorten its TTL or recompute it.
 - **At-least-once delivery.** Restarts replay unacknowledged changes. `DEL` is idempotent so replays are harmless — keep any future handlers idempotent too.
 - **Shutdown.** Ctrl-C (SIGINT) stops replication and the console gracefully. Plain `kill` (SIGTERM) terminates without the graceful path. Also note: `kill %1` won't stop a `go run` child in scripts — kill the `exe/pkg` PID.
 - **Key format.** Keys are `products:p1`, not `product:p1`. Don't mix binaries across the rename.
