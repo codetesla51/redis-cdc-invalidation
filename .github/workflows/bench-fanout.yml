@@ -63,9 +63,10 @@ jobs:
               -e 's/^  rate:.*/  rate: ${{ inputs.rate }}/' \
               -e 's/^concurrency:.*/concurrency: 150/' \
             benchmarks/flood-wide.yaml > /tmp/flood-fanout.yaml
+          VC="docker exec cache valkey-cli"
           (for i in 1 2 3 4 5 6; do
             sleep 5
-            echo "--- t+$((i*5))s pending: $(redis-cli XPENDING cdc invalidators 2>/dev/null | head -n 1) stream: $(redis-cli XLEN cdc 2>/dev/null)"
+            echo "--- t+$((i*5))s pending: $($VC XPENDING cdc invalidators 2>/dev/null | head -n 1) stream: $($VC XLEN cdc 2>/dev/null)"
           done) &
           ~/.local/bin/barrage run -c /tmp/flood-fanout.yaml \
             --json bench-fanout.json --report report-fanout.html 2>&1 | tail -n 3
@@ -73,7 +74,7 @@ jobs:
           sleep 5
           curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
           echo "--- per-consumer applied ---"
-          redis-cli HGETALL cdc:stats:invalidators
+          docker exec cache valkey-cli HGETALL cdc:stats:invalidators || true
 
       - name: Upload results
         uses: actions/upload-artifact@v4
