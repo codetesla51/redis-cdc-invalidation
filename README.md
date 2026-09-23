@@ -10,6 +10,8 @@ This project flips the responsibility: instead of every writer notifying the cac
 
 ## How it works
 
+The diagram shows the stream path, which is the horizontally scalable shape:
+
 ```mermaid
 flowchart LR
     subgraph Writers["Any writer"]
@@ -19,15 +21,19 @@ flowchart LR
     end
 
     Writers --> PG[(Postgres\nsource of truth)]
-    PG -- WAL stream\nlogical slot --> PH[phylax]
-    PH -- OnChange --> ROUTER{hash ID % N}
-    ROUTER --> P0[Pool 0\nconc=1]
-    ROUTER --> P1[Pool 1\nconc=1]
-    ROUTER --> PN[Pool N\nconc=1]
-    P0 & P1 & PN -- DEL table:id --> REDIS[(Redis cache)]
+    PG -->|WAL + logical slot| PH[phylax\nproducer]
+    PH -->|batched XADD| STREAM[(Redis Stream\ncdc)]
+    STREAM -->|XREADGROUP| GROUP[consumer group\ninvalidators]
+    GROUP -->|DEL + XACK| REDIS[(Redis cache)]
+
+    READS[cache-aside reads] -->|hit| REDIS
+    READS -->|miss| PG
+    PG -->|populate| REDIS
 ```
 
-`Write → Postgres commits → phylax reads WAL → hash routes to pool → worker DELs the key → next read repopulates from Postgres`
+`MODE=direct` is the single-process variant: phylax calls `OnChange`, hashes the row ID into an ordered worker shard, and the shard issues `DEL` directly. Stream mode adds the Redis handoff so multiple consumer processes can split the invalidation work.
+
+`Write → Postgres commits → phylax reads WAL → stream or router → DEL the key → next read repopulates from Postgres`
 
 Each stage exists for a specific reason:
 
@@ -127,19 +133,7 @@ The dashboard's `changes_processed` ticks up once per write, and the next `getPr
 
 `direct` mode is the simple single-process path: phylax hashes each row ID to one of the local worker pools and each pool keeps per-key order. It cannot share work across boxes because every process would read the same logical slot and receive every change.
 
-`MODE=produce` splits that path in two:
-
-```mermaid
-flowchart LR
-    PG[(Postgres\nWAL slot)] --> PRODUCER[phylax\nproducer]
-    PRODUCER -->|XADD batch| STREAM[(Redis stream\ncdc)]
-    STREAM -->|XREADGROUP| C1[consumer 1]
-    STREAM -->|XREADGROUP| C2[consumer 2]
-    STREAM -->|XREADGROUP| CN[consumer N]
-    C1 -->|DEL + XACK| REDIS[(Redis cache)]
-    C2 -->|DEL + XACK| REDIS
-    CN -->|DEL + XACK| REDIS
-```
+`MODE=produce` splits that path in two: phylax publishes batched `XADD` records to the stream, and each `MODE=consume` process reads a disjoint slice through the shared `GROUP`:
 
 Consumers in the same `GROUP` share the stream. Redis gives each entry to one consumer, the consumer deletes the cache key, and only then acknowledges the entry. Unacknowledged entries remain pending for redelivery, so the delivery contract is at-least-once. `DEL` is idempotent, so replay and out-of-order delivery are harmless.
 
