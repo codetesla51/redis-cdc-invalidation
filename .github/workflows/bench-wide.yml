@@ -62,6 +62,10 @@ jobs:
           sleep 5
           curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
 
+      - name: Capture Postgres log (post-mortem for DB verdicts)
+        if: always()
+        run: docker logs pg > pg.log 2>&1 || true
+
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -69,5 +73,6 @@ jobs:
           path: |
             bench-10k.json
             report-10k.html
+            pg.log
             producer.log
             consumer.log
