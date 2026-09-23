@@ -25,6 +25,7 @@ type Config struct {
 	Tables    []string
 	Pools     int
 	ChangeBuf int // 0 = phylax default (100); each buffered change ≈ 1KB
+	PubQueue  int // publisher channel cap; each entry ≈ 100 bytes
 	// Mode selects the topology: direct (phylax straight to pools),
 	// produce (phylax appends to Stream), consume (group worker drains
 	// Stream into DELs). Stream/Group matter only off direct.
@@ -41,6 +42,7 @@ func main() {
 		Tables:    parseTables(os.Getenv("TABLES")),
 		Pools:     positiveEnv("WORKER_POOLS", 8),
 		ChangeBuf: positiveEnv("CHANGE_BUFFER_SIZE", 0),
+		PubQueue:  positiveEnv("PUBLISH_QUEUE_SIZE", 100000),
 		Mode:      envOr("MODE", "direct"),
 		Stream:    envOr("STREAM", "cdc"),
 		Group:     envOr("GROUP", "invalidators"),
@@ -129,7 +131,7 @@ func run(ctx context.Context, cfg Config) error {
 	// per tick instead of one round trip per change.
 	var pub *publisher
 	if cfg.Mode == "produce" {
-		pub = newPublisher(rdb, cfg.Stream, 100000, 10*time.Millisecond)
+		pub = newPublisher(rdb, cfg.Stream, cfg.PubQueue, 10*time.Millisecond)
 		go func() {
 			if err := pub.run(ctx); err != nil {
 				log.Printf("publisher: %v", err)

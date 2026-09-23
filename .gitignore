@@ -5,3 +5,4 @@
 *.test
 *.out
 coverage.html
+report.html
