@@ -20,7 +20,7 @@ jobs:
       - name: Start Postgres (logical replication) + Valkey
         run: |
           docker run -d --name pg -e POSTGRES_PASSWORD=postgres \
-            -p 5432:5432 postgres:16 -c wal_level=logical
+            -p 5432:5432 postgres:16 -c wal_level=logical -c max_connections=200
           docker run -d --name cache -p 6379:6379 valkey/valkey:8
           for i in $(seq 1 30); do
             pg_isready -h localhost -U postgres && break || sleep 2
