@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/codetesla51/phylax"
@@ -79,7 +80,7 @@ func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, 
 		return nil
 	}
 
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cdc, err := phylax.New(phylax.Config{
@@ -109,7 +110,7 @@ func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, 
 // cdcStream supervises replication and the console together: either one
 // dying takes the other down, and Ctrl-C shuts both down gracefully.
 func cdcStream(ctx context.Context, cdc *phylax.CDC, httpAddr string) error {
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	srv := cdc.Server()
