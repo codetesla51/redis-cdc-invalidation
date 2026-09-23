@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestProductKey(t *testing.T) {
+func TestCacheKey(t *testing.T) {
 	cases := []struct {
 		name      string
 		table, id string

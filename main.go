@@ -16,37 +16,50 @@ import (
 	"github.com/codetesla51/phylax"
 )
 
-func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
-	}
-	httpAddr := os.Getenv("HTTP_ADDR")
-	if httpAddr == "" {
-		httpAddr = ":8080"
-	}
-	tables := parseTables(os.Getenv("TABLES"))
-	pools := 8
-	if v := os.Getenv("WORKER_POOLS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			log.Fatalf("WORKER_POOLS must be a positive int, got %q", v)
-		}
-		pools = n
-	}
-	changeBuf := 0 // 0 = phylax default (100); each buffered change ≈ 1KB
-	if v := os.Getenv("CHANGE_BUFFER_SIZE"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			log.Fatalf("CHANGE_BUFFER_SIZE must be a positive int, got %q", v)
-		}
-		changeBuf = n
-	}
+// Config carries startup settings. Zero values are useless here, so main
+// builds it entirely from the environment (see README for variables).
+type Config struct {
+	DSN       string
+	RedisAddr string
+	HTTPAddr  string
+	Tables    []string
+	Pools     int
+	ChangeBuf int // 0 = phylax default (100); each buffered change ≈ 1KB
+}
 
-	if err := run(context.Background(), dsn, redisAddr, httpAddr, tables, pools, changeBuf); err != nil {
+func main() {
+	cfg := Config{
+		DSN:       os.Getenv("DATABASE_URL"),
+		RedisAddr: envOr("REDIS_ADDR", "localhost:6379"),
+		HTTPAddr:  envOr("HTTP_ADDR", ":8080"),
+		Tables:    parseTables(os.Getenv("TABLES")),
+		Pools:     positiveEnv("WORKER_POOLS", 8),
+		ChangeBuf: positiveEnv("CHANGE_BUFFER_SIZE", 0),
+	}
+	if err := run(context.Background(), cfg); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// positiveEnv reads a positive-int variable or returns def when unset.
+// Set-but-invalid is fatal: silently running with an unasked-for value is worse.
+func positiveEnv(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Fatalf("%s must be a positive int, got %q", name, v)
+	}
+	return n
 }
 
 // parseTables splits TABLES ("products,orders") into a table list.
@@ -65,17 +78,17 @@ func parseTables(v string) []string {
 }
 
 // run starts the phylax watcher plus its console, or no-ops when DSN is empty.
-func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, pools, changeBuf int) error {
-	router := NewRouter(pools)
+func run(ctx context.Context, cfg Config) error {
+	router := NewRouter(cfg.Pools)
 	defer router.StopAndWait()
 
-	rdb := newRedisClient(redisAddr)
+	rdb := newRedisClient(cfg.RedisAddr)
 	defer rdb.Close()
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("redis ping %s: %w", redisAddr, err)
+		return fmt.Errorf("redis ping %s: %w", cfg.RedisAddr, err)
 	}
 
-	if dsn == "" {
+	if cfg.DSN == "" {
 		fmt.Println("phylax DSN empty, skipping Start")
 		return nil
 	}
@@ -84,16 +97,20 @@ func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, 
 	defer stop()
 
 	cdc, err := phylax.New(phylax.Config{
-		DSN:              dsn,
-		Tables:           tables,
-		ChangeBufferSize: changeBuf,
+		DSN:              cfg.DSN,
+		Tables:           cfg.Tables,
+		ChangeBufferSize: cfg.ChangeBuf,
 	})
 	if err != nil {
 		return err
 	}
 
 	cdc.OnChange(func(c *phylax.Change) {
-		id := rowID(c)
+		id, ok := rowID(c)
+		if !ok {
+			log.Printf("skip %s %s without row id", c.Operation, c.Table)
+			return
+		}
 		router.Dispatch(id, func() {
 			// No per-key logging here: at flood rates, formatting stdout per
 			// DEL is the slowest stage and overflows the change buffer.
@@ -104,7 +121,7 @@ func run(ctx context.Context, dsn, redisAddr, httpAddr string, tables []string, 
 		})
 	})
 
-	return cdcStream(ctx, cdc, httpAddr)
+	return cdcStream(ctx, cdc, cfg.HTTPAddr)
 }
 
 // cdcStream supervises replication and the console together: either one
@@ -149,24 +166,15 @@ func cdcStream(ctx context.Context, cdc *phylax.CDC, httpAddr string) error {
 	}
 }
 
-// rowID extracts the product id for routing.
-// Deletes carry it in OldRow, other ops in NewRow.
-func rowID(c *phylax.Change) string {
+// rowID extracts the row id for routing. Deletes carry it in OldRow,
+// other ops in NewRow. Values are strings (phylax decodes text tuples);
+// anything else — TRUNCATE carries no rows at all — reports missing
+// instead of guessing, and the caller skips it.
+func rowID(c *phylax.Change) (string, bool) {
+	rows := c.NewRow
 	if c.Operation == "delete" {
-		if v, ok := c.OldRow["id"]; ok {
-			return stringify(v)
-		}
-		return ""
+		rows = c.OldRow
 	}
-	if v, ok := c.NewRow["id"]; ok {
-		return stringify(v)
-	}
-	return ""
-}
-
-func stringify(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return fmt.Sprint(v)
+	id, ok := rows["id"].(string)
+	return id, ok && id != ""
 }
