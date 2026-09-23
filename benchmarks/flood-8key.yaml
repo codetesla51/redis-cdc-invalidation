@@ -1,0 +1,34 @@
+duration: 30s
+bucket_width: 1s
+ramp: 5s
+concurrency: 50
+db:
+  rate: 500
+  target:
+    driver: postgres
+    conn: postgres://postgres@localhost:5432/redis_cdc?sslmode=disable
+    queries:
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k0', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k1', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k2', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k3', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k4', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k5', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k6', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write
+      - query: "INSERT INTO products (id, name) VALUES ('flood-k7', 'v') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, updated_at = now()"
+        weight: 1
+        type: write

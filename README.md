@@ -156,6 +156,22 @@ Measured directly: 200 iterations of seed-stale-key → `UPDATE` → poll `EXIST
 
 That window covers commit + WAL + hash route + `DEL` (plus ~1ms of client round trip, so true commit→DEL is slightly under). Reads inside it can serve the pre-write value — if a path needs read-your-write, invalidate inline there alongside CDC.
 
+### Read path: hits vs misses vs stampede
+
+The invalidator only guarantees correctness — whether the cache actually *helps* is a read-side question, measured separately (200 samples each, localhost):
+
+| Path | p50 | p99 |
+|---|---|---|
+| Redis hit | 0.22ms | 3.88ms |
+| Miss → Postgres → repopulate | 1.37ms | 7.03ms |
+| 30 concurrent reads, 1 just-deleted key | 31.6ms | 49.4ms (50ms wall) |
+
+A miss costs ~6× a hit — the delete-tradeoff, quantified. Worse: all 30 burst readers missed and all 30 queried Postgres for the same key (the thundering herd), turning one `DEL` into 30 identical DB reads. If a hot key ever shows this pattern, the fix is `singleflight` at the read path so one flight repopulates while the rest wait.
+
+### Load configs
+
+`benchmarks/` holds the barrage configs used above: `flood-8key.yaml` (lock-contention demo), `flood-wide.yaml` (500 keys, 2000/s), `flood-1m.yaml` (same, 10 minutes). DSNs point at the local dev stack.
+
 ## Tests
 
 ```sh
