@@ -25,19 +25,16 @@ func NewRouter(n int) *Router {
 	return r
 }
 
-// Owner returns the pool index owning id.
 func (r *Router) Owner(id string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(id))
 	return int(h.Sum32() % uint32(len(r.pools)))
 }
 
-// Dispatch submits fn to the pool owning id.
 func (r *Router) Dispatch(id string, fn func()) {
 	r.pools[r.Owner(id)].Submit(fn)
 }
 
-// StopAndWait stops all pools and waits for queued tasks.
 func (r *Router) StopAndWait() {
 	for _, p := range r.pools {
 		p.StopAndWait()

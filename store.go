@@ -36,7 +36,6 @@ type Store struct {
 	fetch func(ctx context.Context, table, id string) ([]byte, error)
 }
 
-// NewStore wires a Store over live Redis and Postgres connections.
 func NewStore(rdb *redis.Client, pool *pgxpool.Pool) *Store {
 	s := &Store{rdb: rdb, pool: pool, cb: newBreaker(3, 5*time.Second)}
 	s.fetch = s.fetchRow
