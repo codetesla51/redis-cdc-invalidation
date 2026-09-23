@@ -31,6 +31,11 @@ jobs:
           PGPASSWORD=postgres psql -h localhost -U postgres -d redis_cdc \
             -c "CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
 
+      - name: Box specs
+        run: |
+          echo "cpus: $(nproc)"; free -h | head -n 2
+          grep -m1 "model name" /proc/cpuinfo; grep -m1 "cpu MHz" /proc/cpuinfo
+
       - name: Build + start producer and consumer
         run: |
           go build -o cdc-load ./...
