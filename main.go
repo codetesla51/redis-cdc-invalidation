@@ -125,13 +125,24 @@ func run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	// Produce mode publishes through a batching publisher: one pipeline
+	// per tick instead of one round trip per change.
+	var pub *publisher
+	if cfg.Mode == "produce" {
+		pub = newPublisher(rdb, cfg.Stream, 100000, 10*time.Millisecond)
+		go func() {
+			if err := pub.run(ctx); err != nil {
+				log.Printf("publisher: %v", err)
+				stop()
+			}
+		}()
+	}
+
 	cdc.OnChange(func(c *phylax.Change) {
 		// Produce mode fans out through the stream (many boxes share the
 		// load); direct mode keeps the original straight-to-pool path.
 		if cfg.Mode == "produce" {
-			if err := publishChange(context.Background(), rdb, cfg.Stream, c); err != nil {
-				log.Printf("publish %s %s: %v", c.Operation, c.Table, err)
-			}
+			pub.publish(c)
 			return
 		}
 		id, ok := rowID(c)

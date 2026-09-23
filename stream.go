@@ -7,32 +7,94 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/codetesla51/phylax"
 	"github.com/redis/go-redis/v9"
 )
 
-// publishChange appends one WAL change to the stream. Consumers in a group
-// split these entries; each entry carries everything a worker needs.
-func publishChange(ctx context.Context, rdb *redis.Client, stream string, c *phylax.Change) error {
+// streamEntry is one WAL change distilled to what a worker needs: DEL
+// takes only table+id, so entries stay tiny (~100 bytes).
+type streamEntry struct {
+	table, op, id string
+}
+
+// publisher batches WAL changes and flushes them as one pipeline per tick,
+// turning ~100µs per XADD into ~1µs amortized. The queue absorbs bursts;
+// beyond its cap, entries drop loudly (logged) rather than stalling the
+// broadcast loop — size the cap for the worst burst, not the average rate.
+type publisher struct {
+	rdb      *redis.Client
+	stream   string
+	interval time.Duration
+	queue    chan streamEntry
+	dropped  atomic.Int64
+}
+
+func newPublisher(rdb *redis.Client, stream string, queueCap int, interval time.Duration) *publisher {
+	return &publisher{rdb: rdb, stream: stream, interval: interval, queue: make(chan streamEntry, queueCap)}
+}
+
+// publish enqueues one change; id-less changes (TRUNCATE) have no key.
+func (p *publisher) publish(c *phylax.Change) {
 	id, ok := rowID(c)
 	if !ok {
-		return nil // TRUNCATE and id-less changes have no key to route
+		return
 	}
-	// MaxLen caps the stream so a dead consumer group can't grow it
-	// forever: ~100k entries ≈ 10MB, then old entries trim even unacked.
-	// (Unacked-but-trimmed entries are covered by the WAL slot replay.)
-	return rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: stream,
-		MaxLen: 100000,
-		Approx: true,
-		Values: map[string]any{
-			"table": c.Table,
-			"op":    c.Operation,
-			"id":    id,
-		},
-	}).Err()
+	select {
+	case p.queue <- streamEntry{table: c.Table, op: c.Operation, id: id}:
+	default:
+		n := p.dropped.Add(1)
+		log.Printf("publish queue full, dropped %d total", n)
+	}
+}
+
+// run flushes every tick until ctx ends, then drains once and returns.
+func (p *publisher) run(ctx context.Context) error {
+	tick := time.NewTicker(p.interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return p.flush(context.Background())
+		case <-tick.C:
+			if err := p.flush(ctx); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// flush sends everything queued as a single pipeline. Order within the
+// batch is preserved, so per-key order survives batching.
+func (p *publisher) flush(ctx context.Context) error {
+	n := len(p.queue)
+	if n == 0 {
+		return nil
+	}
+	if n > 5000 {
+		n = 5000
+	}
+	_, err := p.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i := 0; i < n; i++ {
+			select {
+			case e := <-p.queue:
+				// MaxLen caps the stream so a dead consumer group can't
+				// grow it forever (~100k entries ≈ 4MB measured).
+				pipe.XAdd(ctx, &redis.XAddArgs{
+					Stream: p.stream,
+					MaxLen: 100000,
+					Approx: true,
+					Values: map[string]any{"table": e.table, "op": e.op, "id": e.id},
+				})
+			default:
+				return nil
+			}
+		}
+		return nil
+	})
+	return err
 }
 
 // ensureGroup creates the consumer group once; BUSYGROUP means it exists.
