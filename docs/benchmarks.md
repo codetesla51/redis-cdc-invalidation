@@ -23,6 +23,7 @@ slot lag via `pg_replication_slots`).
 | 500 keys, 2000/s, buffer 5000 | 54,997 | 93.3% | 1,833/s | 129ms | +51k | 0 |
 | 500 keys, 2000/s | 54,984 | 47.1% | 1,833/s | 202ms | +26k | 0 |
 | 500 keys, 2000/s, 10 min, buffer 5000 | 1,189,998 | 100% | 1,983/s | 103ms | +1.19M | 0 |
+| 10k keys, CI ladder (barrage v0.6.5) | 55k / 115k / 1.19M | 100% | 1,833–1,983/s | 2ms | clean | 0 |
 
 What the runs taught:
 
@@ -31,6 +32,28 @@ What the runs taught:
 - **The dashboard tab drops.** 25k drops in one run traced to a Firefox tab on the console: its `/events` feed (10-deep buffer) can't drink a 1.8k/s firehose, so phylax dropped *its* copies. The invalidator never missed one — drop-on-full protecting the stream, exactly as designed. Close the tab for clean numbers.
 - **The 100-deep buffer clips bursts.** 330 drops (0.6%) at 1.8k/s with one subscriber. Removing per-key logging changed nothing (156 → 330), disproving the first theory — burst depth, not consumer speed, was the cause. Fix: `CHANGE_BUFFER_SIZE=5000` (phylax `v0.3.3`, ~1KB per change) → drops 0 on reflood.
 - **Sustained proof.** 10 minutes, 1.19M writes, 100% success, P99 103ms, zero drops, slot lag drained to idle — run with `CHANGE_BUFFER_SIZE=5000` (`WORKER_POOLS=8`, `TABLES=products`). The pipeline holds.
+
+> [!NOTE] What P99 means here
+> Every P99 in the table above is **Postgres write latency** (how long each
+> `INSERT` took), measured by barrage. It says nothing about the stream
+> fan-out: that health is read off separate dials — `changes_dropped`,
+> group backlog (`XPENDING`), and the producer/consumer logs. A slow P99
+> with zero drops means the database sweated and the pipeline didn't miss
+> one. Conflating the two caused most of the confusion below.
+
+## The 10k saga (a wrong-number detective story)
+
+The 10k-key runs scored 43–58% "DB failing" three times running. Three
+theories died with evidence before the fourth stuck:
+
+1. **Pool contention** — widened barrage 80→150 and Postgres 100→200. Score: 43% → 45%. Falsified.
+2. **Cold-insert cost** — plausible (10k fresh index entries vs 500 hot rewrites) but untestable post-mortem; the VM was gone with the evidence.
+3. **Faster box, same failure** — 4 CPU/16GB EPYC, still 45%. Not hardware.
+4. **The load generator** — barrage rebuilt its 10,000-entry cumulative weight table **per request** (40M element-ops/sec of self-inflicted overhead) and then linear-scanned it. Postgres's own log showed zero errors throughout: the database was innocent, the tool was timing out on its own paperwork.
+
+Fixes, both in barrage: hoist the table build out of the hot path (v0.6.4), then binary search over it (v0.6.5, proven identical winners over 50k draws, 916ns/op on 10k). Rerun: 115,000 writes, 100%, P99 ~0ms. The keyspace question resolved the way theory predicted — wide keys are faster — once the measuring tool stopped tripping over itself.
+
+Lesson kept: when the target's own logs are clean, interrogate the harness before theorizing about the target.
 
 ## Invalidation lag
 
