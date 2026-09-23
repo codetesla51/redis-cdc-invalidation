@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -13,9 +14,21 @@ func cacheKey(table, id string) string {
 	return table + ":" + id
 }
 
-// newRedisClient dials Redis/Valkey at addr. Callers Ping to fail fast.
+// newRedisClient dials Redis/Valkey at addr. Fail-fast on purpose: when the
+// cache is down, every read degrades to Postgres, so the client must fail
+// fast instead of burning time before the fallback runs. DialerRetries (not
+// MaxRetries) governs pool dial attempts — go-redis retries dead-server
+// dials 5 times by default, ~1.8s per op. One attempt is sufficient signal
+// to take the degradation path.
 func newRedisClient(addr string) *redis.Client {
-	return redis.NewClient(&redis.Options{Addr: addr})
+	return redis.NewClient(&redis.Options{
+		Addr:          addr,
+		DialTimeout:   500 * time.Millisecond,
+		ReadTimeout:   1 * time.Second,
+		WriteTimeout:  1 * time.Second,
+		MaxRetries:    0,
+		DialerRetries: 1,
+	})
 }
 
 // invalidateProduct deletes the cached row so the next read repopulates

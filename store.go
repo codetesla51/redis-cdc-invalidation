@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -29,6 +30,7 @@ type Store struct {
 	rdb    *redis.Client
 	pool   *pgxpool.Pool
 	flight singleflight.Group
+	cb     *circuitBreaker
 	// fetch loads one row from Postgres; a field (not a method) so tests
 	// can substitute a counting fake without a database.
 	fetch func(ctx context.Context, table, id string) ([]byte, error)
@@ -36,11 +38,51 @@ type Store struct {
 
 // NewStore wires a Store over live Redis and Postgres connections.
 func NewStore(rdb *redis.Client, pool *pgxpool.Pool) *Store {
-	s := &Store{rdb: rdb, pool: pool}
+	s := &Store{rdb: rdb, pool: pool, cb: newBreaker(3, 5*time.Second)}
 	s.fetch = s.fetchRow
 	return s
 }
 
+// circuitBreaker skips Redis entirely after consecutive failures, so a dead
+// cache costs ~zero instead of one failed dial per read. Success resets it;
+// after the cooldown, one probe read tests whether Redis is back.
+type circuitBreaker struct {
+	mu        sync.Mutex
+	fails     int
+	until     time.Time
+	threshold int
+	cooldown  time.Duration
+}
+
+func newBreaker(threshold int, cooldown time.Duration) *circuitBreaker {
+	return &circuitBreaker{threshold: threshold, cooldown: cooldown}
+}
+
+// allow reports whether Redis should be attempted right now.
+func (b *circuitBreaker) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return time.Now().After(b.until)
+}
+
+// record notes one Redis outcome: ok resets the count, failure advances it,
+// tripping the breaker for cooldown once threshold is reached.
+func (b *circuitBreaker) record(ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ok {
+		b.fails = 0
+		b.until = time.Time{}
+		return
+	}
+	b.fails++
+	if b.fails >= b.threshold {
+		b.until = time.Now().Add(b.cooldown)
+	}
+}
+
+// name is interpolated into SQL (placeholders can't name tables), so this
+// check is the SQL-injection boundary: letters, digits, underscores only.
 // validTableName rejects anything that is not a plain identifier. The table
 // name is interpolated into SQL (placeholders can't name tables), so this
 // check is the SQL-injection boundary: letters, digits, underscores only.
@@ -67,18 +109,30 @@ func (s *Store) Get(ctx context.Context, table, id string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid table %q", table)
 	}
 	key := cacheKey(table, id)
-	if hit, err := s.rdb.Get(ctx, key).Bytes(); err == nil && json.Valid(hit) {
-		return hit, nil
+	useCache := s.cb.allow()
+	if useCache {
+		if hit, err := s.rdb.Get(ctx, key).Bytes(); err == nil && json.Valid(hit) {
+			s.cb.record(true)
+			return hit, nil
+		} else if errors.Is(err, redis.Nil) {
+			s.cb.record(true) // a miss means Redis is up
+		} else {
+			s.cb.record(false)
+			useCache = false
+		}
 	}
-	// Miss, corrupt entry, or Redis down: Postgres is the source of truth.
+	// Miss, corrupt entry, Redis down, or breaker open: Postgres is the source of truth.
 	// The separator keeps ("ab","c") and ("a","bc") in separate flights.
 	v, err, _ := s.flight.Do(table+"\x00"+id, func() (any, error) {
 		data, err := s.fetch(ctx, table, id)
 		if err != nil {
 			return nil, err
 		}
-		// Best-effort repopulate; a failed SET just means the next read misses again.
-		_ = s.rdb.Set(ctx, key, data, productTTL).Err()
+		// Best-effort repopulate; skipped while the breaker is open, and a
+		// failed SET just means the next read misses again.
+		if useCache {
+			_ = s.rdb.Set(ctx, key, data, productTTL).Err()
+		}
 		return data, nil
 	})
 	if err != nil {

@@ -69,68 +69,65 @@ func TestValidTableName(t *testing.T) {
 }
 
 // TestStoreGetLive walks the whole cache-aside contract against real
-// Postgres + Redis on two different tables: miss populates, hit serves
-// stale, invalidate refreshes, unknown id is not found.
+// Postgres + Redis: miss populates, hit serves stale, invalidate refreshes,
+// unknown id is not found. It runs on a scratch table OUTSIDE the
+// publication on purpose: the live watcher streams watched tables, so using
+// products/orders here would race its DELs against the assertions.
 func TestStoreGetLive(t *testing.T) {
 	rdb := testRedis(t)
 	pool := testPool(t)
 	store := NewStore(rdb, pool)
 	ctx := context.Background()
 
-	tables := []struct {
-		table, id, col, v1, v2 string
-	}{
-		{"products", "cache-aside-p1", "name", "v1", "v2"},
-		{"orders", "cache-aside-o1", "item", "v1", "v2"},
-	}
-	for _, tc := range tables {
-		t.Run(tc.table, func(t *testing.T) {
-			seed := `INSERT INTO ` + tc.table + ` (id, ` + tc.col + `) VALUES ($1, $2)
-				ON CONFLICT (id) DO UPDATE SET ` + tc.col + ` = EXCLUDED.` + tc.col
-			if _, err := pool.Exec(ctx, seed, tc.id, tc.v1); err != nil {
-				t.Fatalf("seed row: %v", err)
-			}
-			t.Cleanup(func() {
-				pool.Exec(context.Background(), `DELETE FROM `+tc.table+` WHERE id = $1`, tc.id)
-				rdb.Del(context.Background(), cacheKey(tc.table, tc.id))
-			})
-			if err := rdb.Del(ctx, cacheKey(tc.table, tc.id)).Err(); err != nil {
-				t.Fatalf("force miss: %v", err)
-			}
-
-			// Miss → Postgres → repopulate.
-			data, err := store.Get(ctx, tc.table, tc.id)
-			if err != nil || !strings.Contains(string(data), `"v1"`) {
-				t.Fatalf("miss: got %s err %v, want v1", data, err)
-			}
-			if n := rdb.Exists(ctx, cacheKey(tc.table, tc.id)).Val(); n != 1 {
-				t.Fatal("miss did not populate Redis")
-			}
-
-			// Hit → serves cached v1 even though Postgres moved to v2.
-			move := `UPDATE ` + tc.table + ` SET ` + tc.col + ` = $2 WHERE id = $1`
-			if _, err := pool.Exec(ctx, move, tc.id, tc.v2); err != nil {
-				t.Fatalf("move db: %v", err)
-			}
-			if data, err := store.Get(ctx, tc.table, tc.id); err != nil || !strings.Contains(string(data), `"v1"`) {
-				t.Fatalf("hit: got %s err %v, want stale v1", data, err)
-			}
-
-			// Invalidate → next read refreshes to v2.
-			if err := invalidateProduct(ctx, rdb, tc.table, tc.id); err != nil {
-				t.Fatalf("invalidate: %v", err)
-			}
-			if data, err := store.Get(ctx, tc.table, tc.id); err != nil || !strings.Contains(string(data), `"v2"`) {
-				t.Fatalf("refresh: got %s err %v, want v2", data, err)
-			}
-		})
+	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS cdc_test_kv (
+		id TEXT PRIMARY KEY, val TEXT NOT NULL)`); err != nil {
+		t.Fatalf("scratch table: %v", err)
 	}
 
-	// Unknown id → not found, and misses are not cached.
-	if _, err := store.Get(ctx, "products", "no-such-product"); !errors.Is(err, ErrNotFound) {
+	const table, id = "cdc_test_kv", "k1"
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO cdc_test_kv (id, val) VALUES ($1, 'v1')
+		 ON CONFLICT (id) DO UPDATE SET val = 'v1'`, id); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DELETE FROM cdc_test_kv WHERE id = $1`, id)
+		rdb.Del(context.Background(), cacheKey(table, id))
+	})
+	if err := rdb.Del(ctx, cacheKey(table, id)).Err(); err != nil {
+		t.Fatalf("force miss: %v", err)
+	}
+
+	// Miss -> Postgres -> repopulate.
+	data, err := store.Get(ctx, table, id)
+	if err != nil || !strings.Contains(string(data), `"v1"`) {
+		t.Fatalf("miss: got %s err %v, want v1", data, err)
+	}
+	if n := rdb.Exists(ctx, cacheKey(table, id)).Val(); n != 1 {
+		t.Fatal("miss did not populate Redis")
+	}
+
+	// Hit -> serves cached v1 even though Postgres moved to v2.
+	if _, err := pool.Exec(ctx, `UPDATE cdc_test_kv SET val = 'v2' WHERE id = $1`, id); err != nil {
+		t.Fatalf("move db: %v", err)
+	}
+	if data, err := store.Get(ctx, table, id); err != nil || !strings.Contains(string(data), `"v1"`) {
+		t.Fatalf("hit: got %s err %v, want stale v1", data, err)
+	}
+
+	// Invalidate -> next read refreshes to v2.
+	if err := invalidateProduct(ctx, rdb, table, id); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	if data, err := store.Get(ctx, table, id); err != nil || !strings.Contains(string(data), `"v2"`) {
+		t.Fatalf("refresh: got %s err %v, want v2", data, err)
+	}
+
+	// Unknown id -> not found, and misses are not cached.
+	if _, err := store.Get(ctx, table, "no-such-key"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown id: got %v, want ErrNotFound", err)
 	}
-	if n := rdb.Exists(ctx, cacheKey("products", "no-such-product")).Val(); n != 0 {
+	if n := rdb.Exists(ctx, cacheKey(table, "no-such-key")).Val(); n != 0 {
 		t.Fatal("miss cached a negative entry")
 	}
 
@@ -147,6 +144,7 @@ func TestSingleflightDedup(t *testing.T) {
 	rdb := testRedis(t)
 	store := NewStore(rdb, nil)
 	_ = rdb.Del(context.Background(), cacheKey("products", "herd-p1")).Err()
+	t.Cleanup(func() { rdb.Del(context.Background(), cacheKey("products", "herd-p1")) })
 
 	release := make(chan struct{})
 	var calls atomic.Int64
@@ -179,5 +177,37 @@ func TestSingleflightDedup(t *testing.T) {
 		if errs[i] != nil || !strings.Contains(got[i], `"shared":true`) {
 			t.Fatalf("rider %d: got %s err %v, want shared", i, got[i], errs[i])
 		}
+	}
+}
+
+// TestCircuitBreaker is pure logic, no infrastructure: failures trip the
+// breaker for the cooldown, success resets it, expiry re-allows.
+func TestCircuitBreaker(t *testing.T) {
+	b := newBreaker(3, 50*time.Millisecond)
+	if !b.allow() {
+		t.Fatal("fresh breaker must allow")
+	}
+	b.record(false)
+	b.record(false)
+	if !b.allow() {
+		t.Fatal("below threshold must still allow")
+	}
+	b.record(false)
+	if b.allow() {
+		t.Fatal("at threshold must trip")
+	}
+	b.record(true) // success resets even mid-trip
+	if !b.allow() {
+		t.Fatal("success must reset the breaker")
+	}
+	b.record(false)
+	b.record(false)
+	b.record(false)
+	if b.allow() {
+		t.Fatal("must trip again")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if !b.allow() {
+		t.Fatal("cooldown expiry must re-allow")
 	}
 }
