@@ -169,6 +169,10 @@ The invalidator only guarantees correctness — whether the cache actually *help
 
 A miss costs ~5× a hit — the delete-tradeoff, quantified. The burst row is the `singleflight` payoff: before it, all 30 readers stormed Postgres (50ms wall); now one flight repopulates while 29 share, wall 7.6ms. If a hot key ever outgrows even this, the next lever is a shorter TTL or a warmer (recompute) for that key alone.
 
+### Update side: the cost of deleting unread keys
+
+The tweet's other half: every change costs a Redis write even for keys nobody reads. Measured: after the write floods, `DBSIZE` showed essentially zero flood keys cached — in a write-heavy workload ~100% of `DEL`s hit absent keys. Cost per `DEL` (100k samples, sequential, localhost): **~165µs no-op, ~367µs deleting** (the latter includes re-`SET` setup per iteration; both dominated by round trip, server time is sub-microsecond). Across 8 pools at 2k writes/sec, that's ~4% pool utilization — noise. Recompute (`SELECT` + serialize + `SET` per change) would cost strictly more per unread key, so `DEL` stays. Revisit only if a specific hot key's cold-miss cost is measured.
+
 ### Load configs
 
 `benchmarks/` holds the barrage configs used above: `flood-8key.yaml` (lock-contention demo), `flood-wide.yaml` (500 keys, 2000/s), `flood-1m.yaml` (same, 10 minutes). DSNs point at the local dev stack.
