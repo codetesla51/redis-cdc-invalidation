@@ -135,6 +135,32 @@ MODE=consume /tmp/opencode/cdc-load
 
 Proven live: one insert → key gone, group backlog empty.
 
+Example — three terminals. Terminal 1, the writer (needs the DB):
+
+```sh
+DATABASE_URL='postgres://postgres@localhost:5432/redis_cdc' TABLES='products' MODE=produce /tmp/opencode/cdc-load
+```
+
+Terminal 2, an eater (needs only Valkey — no Postgres credentials):
+
+```sh
+MODE=consume /tmp/opencode/cdc-load
+# consuming cdc as invalidators/uthman-210895
+```
+
+Terminal 3, the proof. Seed a stale cached key, write the row, watch it die:
+
+```sh
+valkey-cli SET products:demobox stale
+psql -h localhost -U postgres -d redis_cdc \
+  -c "INSERT INTO products (id, name) VALUES ('demobox','book');"
+valkey-cli EXISTS products:demobox  # 0 — gone
+valkey-cli XRANGE cdc - +           # the note: table products, op insert, id demobox
+valkey-cli XPENDING cdc invalidators # empty — every entry ACKed
+```
+
+Add more Terminal-2 boxes to split the load; each entry reaches exactly one of them.
+
 ## Monitoring
 
 `cdcStream` supervises replication and the console as one unit: either side dying takes the other down, and Ctrl-C shuts both down gracefully. While running, watch:
