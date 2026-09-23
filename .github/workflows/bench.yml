@@ -47,7 +47,7 @@ jobs:
           curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
 
       - name: Install barrage
-        run: curl -fsSL https://raw.githubusercontent.com/codetesla51/barrage/main/install.sh | bash
+        run: curl -fsSL https://raw.githubusercontent.com/codetesla51/barrage/main/install.sh | bash -s -- --version v0.6.3
 
       - name: Ladder (50k, 100k, 1M — sequential, never parallel)
         run: |
