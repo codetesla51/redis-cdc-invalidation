@@ -44,11 +44,20 @@ jobs:
       - name: Install barrage
         run: curl -fsSL https://raw.githubusercontent.com/codetesla51/barrage/main/install.sh | bash
 
-      - name: Flood (500 keys, 2000/s, 30s)
+      - name: Ladder (50k, 100k, 1M — sequential, never parallel)
         run: |
           sed 's#postgres://postgres@localhost#postgres://postgres:postgres@localhost#' \
             benchmarks/flood-wide.yaml > /tmp/flood-ci.yaml
-          ~/.local/bin/barrage run -c /tmp/flood-ci.yaml --json bench.json 2>&1 | tail -n 5
+          sed -e 's#postgres://postgres@localhost#postgres://postgres:postgres@localhost#' \
+              -e 's/^duration:.*/duration: 60s/' benchmarks/flood-wide.yaml > /tmp/flood-100k.yaml
+          sed -e 's#postgres://postgres@localhost#postgres://postgres:postgres@localhost#' \
+            benchmarks/flood-1m.yaml > /tmp/flood-1m-ci.yaml
+          ~/.local/bin/barrage run -c /tmp/flood-ci.yaml \
+            --json bench-50k.json --report report-50k.html 2>&1 | tail -n 3
+          ~/.local/bin/barrage run -c /tmp/flood-100k.yaml \
+            --json bench-100k.json --report report-100k.html 2>&1 | tail -n 3
+          ~/.local/bin/barrage run -c /tmp/flood-1m-ci.yaml \
+            --json bench-1m.json --report report-1m.html 2>&1 | tail -n 3
           sleep 5
           curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
 
@@ -57,7 +66,7 @@ jobs:
         with:
           name: bench-results
           path: |
-            bench.json
-            report.html
+            bench-*.json
+            report-*.html
             producer.log
             consumer.log
