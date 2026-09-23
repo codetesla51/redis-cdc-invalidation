@@ -62,8 +62,7 @@ func positiveEnv(name string, def int) int {
 	return n
 }
 
-// parseTables splits TABLES ("products,orders") into a table list.
-// Empty means the default: just products.
+// parseTables splits TABLES; empty means just products.
 func parseTables(v string) []string {
 	var tables []string
 	for _, t := range strings.Split(v, ",") {
@@ -162,7 +161,7 @@ func cdcStream(ctx context.Context, cdc *phylax.CDC, httpAddr string) error {
 	case <-ctx.Done():
 		shutdown()
 		<-srvErr
-		return <-cdcErr // nil on a clean Ctrl-C.
+		return <-cdcErr
 	}
 }
 
