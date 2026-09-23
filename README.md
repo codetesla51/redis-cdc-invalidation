@@ -1,6 +1,6 @@
 # redis-cdc-invalidation
 
-Keep a Redis cache in sync with Postgres automatically. Instead of clearing the cache in every write path, this watches Postgres's write-ahead log (WAL) and deletes the matching Redis key on every insert, update, and delete — from any writer, with zero polling.
+A worked implementation of the Cache-Invalidation-via-CDC design — not a shrink-wrapped program. It exists to prove the pattern end to end (with measured numbers) and to be copied from: watch Postgres's write-ahead log (WAL) and delete the matching Redis key on every insert, update, and delete — from any writer, with zero polling.
 
 ## The problem
 
