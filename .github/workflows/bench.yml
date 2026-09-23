@@ -1,0 +1,63 @@
+# Ephemeral benchmark: spins up Postgres + Valkey + producer + consumer on one
+# throwaway VM, floods it, uploads the report, then the VM is dropped.
+# Same-box numbers are relative (see docs/benchmarks.md) — this gates
+# regressions and proves shape, not absolute capacity.
+name: Bench
+on:
+  workflow_dispatch:
+
+jobs:
+  flood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Start Postgres (logical replication) + Valkey
+        run: |
+          docker run -d --name pg -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 postgres:16 -c wal_level=logical
+          docker run -d --name cache -p 6379:6379 valkey/valkey:8
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -U postgres && break || sleep 2
+          done
+
+      - name: Seed database
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE redis_cdc;"
+          PGPASSWORD=postgres psql -h localhost -U postgres -d redis_cdc \
+            -c "CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+
+      - name: Build + start producer and consumer
+        run: |
+          go build -o cdc-load ./...
+          export DATABASE_URL='postgres://postgres:postgres@localhost:5432/redis_cdc'
+          TABLES='products' MODE=produce STREAM=cdc CHANGE_BUFFER_SIZE=5000 \
+            ./cdc-load > producer.log 2>&1 &
+          MODE=consume STREAM=cdc ./cdc-load > consumer.log 2>&1 &
+          sleep 8
+          curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
+
+      - name: Install barrage
+        run: curl -fsSL https://raw.githubusercontent.com/codetesla51/barrage/main/install.sh | bash
+
+      - name: Flood (500 keys, 2000/s, 30s)
+        run: |
+          sed 's#postgres://postgres@localhost#postgres://postgres:postgres@localhost#' \
+            benchmarks/flood-wide.yaml > /tmp/flood-ci.yaml
+          ~/.local/bin/barrage run -c /tmp/flood-ci.yaml --json bench.json 2>&1 | tail -n 5
+          sleep 5
+          curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench.json
+            report.html
+            producer.log
+            consumer.log
