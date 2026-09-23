@@ -46,6 +46,9 @@ func TestStreamRoundTrip(t *testing.T) {
 	if err != nil || pending.Count != 0 {
 		t.Fatalf("pending=%+v err=%v, want empty (ACKed)", pending, err)
 	}
+	if got := rdb.HGetAll(ctx, "cdc:stats:"+group).Val(); got["test-consumer"] != "1" {
+		t.Fatalf("stats=%v, want test-consumer:1", got)
+	}
 }
 
 // TestPublishBatch proves 500 rapid publishes land as one pipeline worth of

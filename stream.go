@@ -136,6 +136,11 @@ func consumeOnce(ctx context.Context, rdb *redis.Client, stream, group, consumer
 			applied++
 		}
 	}
+	// Per-consumer applied counts make fan-out splits observable: one
+	// HINCRBY per batch ≈ 1 extra op per ~100 DELs.
+	if applied > 0 {
+		_ = rdb.HIncrBy(ctx, "cdc:stats:"+group, consumer, int64(applied)).Err()
+	}
 	return applied, nil
 }
 

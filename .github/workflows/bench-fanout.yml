@@ -1,0 +1,86 @@
+# Fan-out showdown: 1 vs 4 stream consumers at a rate above single-consumer
+# capacity. Matrix legs run on separate VMs (no interference). A leg proves
+# sharing if pending stays flat and all N consumers show applied counts.
+name: Bench-fanout
+on:
+  workflow_dispatch:
+    inputs:
+      rate:
+        description: 'DB writes/sec target (above ~3k stresses one consumer)'
+        default: '4000'
+
+jobs:
+  flood:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        consumers: [1, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Box specs
+        run: |
+          echo "cpus: $(nproc)"; free -h | head -n 2
+          grep -m1 "model name" /proc/cpuinfo; grep -m1 "cpu MHz" /proc/cpuinfo
+
+      - name: Start Postgres (logical replication) + Valkey
+        run: |
+          docker run -d --name pg -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 postgres:16 -c wal_level=logical -c max_connections=200
+          docker run -d --name cache -p 6379:6379 valkey/valkey:8
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -U postgres && break || sleep 2
+          done
+
+      - name: Seed database
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE redis_cdc;"
+          PGPASSWORD=postgres psql -h localhost -U postgres -d redis_cdc \
+            -c "CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+
+      - name: Build + start producer and N consumers
+        run: |
+          go build -o cdc-load ./...
+          export DATABASE_URL='postgres://postgres:postgres@localhost:5432/redis_cdc'
+          TABLES='products' MODE=produce STREAM=cdc CHANGE_BUFFER_SIZE=5000 \
+            ./cdc-load > producer.log 2>&1 &
+          for i in $(seq 1 ${{ matrix.consumers }}); do
+            MODE=consume STREAM=cdc ./cdc-load > consumer-$i.log 2>&1 &
+          done
+          sleep 8
+          curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
+
+      - name: Install barrage
+        run: curl -fsSL https://raw.githubusercontent.com/codetesla51/barrage/main/install.sh | bash -s -- --version v0.6.5
+
+      - name: Flood (500 keys, N consumers)
+        run: |
+          sed -e 's#postgres://postgres@localhost#postgres://postgres:postgres@localhost#' \
+              -e 's/^  rate:.*/  rate: ${{ inputs.rate }}/' \
+              -e 's/^concurrency:.*/concurrency: 150/' \
+            benchmarks/flood-wide.yaml > /tmp/flood-fanout.yaml
+          (for i in 1 2 3 4 5 6; do
+            sleep 5
+            echo "--- t+$((i*5))s pending: $(redis-cli XPENDING cdc invalidators 2>/dev/null | head -n 1) stream: $(redis-cli XLEN cdc 2>/dev/null)"
+          done) &
+          ~/.local/bin/barrage run -c /tmp/flood-fanout.yaml \
+            --json bench-fanout.json --report report-fanout.html 2>&1 | tail -n 3
+          wait
+          sleep 5
+          curl -s -m 5 http://localhost:8080/metrics/stream | head -n 1
+          echo "--- per-consumer applied ---"
+          redis-cli HGETALL cdc:stats:invalidators
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-fanout-${{ matrix.consumers }}c
+          path: |
+            bench-fanout.json
+            report-fanout.html
+            producer.log
+            consumer-*.log
