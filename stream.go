@@ -20,8 +20,13 @@ func publishChange(ctx context.Context, rdb *redis.Client, stream string, c *phy
 	if !ok {
 		return nil // TRUNCATE and id-less changes have no key to route
 	}
+	// MaxLen caps the stream so a dead consumer group can't grow it
+	// forever: ~100k entries ≈ 10MB, then old entries trim even unacked.
+	// (Unacked-but-trimmed entries are covered by the WAL slot replay.)
 	return rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: stream,
+		MaxLen: 100000,
+		Approx: true,
 		Values: map[string]any{
 			"table": c.Table,
 			"op":    c.Operation,
