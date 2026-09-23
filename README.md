@@ -163,11 +163,11 @@ The invalidator only guarantees correctness — whether the cache actually *help
 
 | Path | p50 | p99 |
 |---|---|---|
-| Redis hit | 0.22ms | 3.88ms |
-| Miss → Postgres → repopulate | 1.37ms | 7.03ms |
-| 30 concurrent reads, 1 just-deleted key | 31.6ms | 49.4ms (50ms wall) |
+| Redis hit | 0.06ms | 0.16ms |
+| Miss → Postgres → repopulate | 0.28ms | 0.47ms |
+| 30 concurrent reads, 1 just-deleted key (singleflight) | 6.8ms | 7.3ms (7.6ms wall) |
 
-A miss costs ~6× a hit — the delete-tradeoff, quantified. Worse: all 30 burst readers missed and all 30 queried Postgres for the same key (the thundering herd), turning one `DEL` into 30 identical DB reads. If a hot key ever shows this pattern, the fix is `singleflight` at the read path so one flight repopulates while the rest wait.
+A miss costs ~5× a hit — the delete-tradeoff, quantified. The burst row is the `singleflight` payoff: before it, all 30 readers stormed Postgres (50ms wall); now one flight repopulates while 29 share, wall 7.6ms. If a hot key ever outgrows even this, the next lever is a shorter TTL or a warmer (recompute) for that key alone.
 
 ### Load configs
 
