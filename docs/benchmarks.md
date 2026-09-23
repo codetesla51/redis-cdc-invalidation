@@ -81,6 +81,21 @@ With the cache down entirely: reads degrade to Postgres correctly, and a circuit
 
 Every change costs a Redis write even for keys nobody reads. Measured: after the write floods, `DBSIZE` showed essentially zero flood keys cached — in a write-heavy workload ~100% of `DEL`s hit absent keys. Cost per `DEL` (100k samples, sequential, localhost): **~165µs no-op, ~367µs deleting** (the latter includes re-`SET` setup per iteration; both dominated by round trip, server time is sub-microsecond). Across 8 pools at 2k writes/sec, that's ~4% pool utilization — noise. Recompute (`SELECT` + serialize + `SET` per change) would cost strictly more per unread key, so `DEL` stays. Revisit only if a specific hot key's cold-miss cost is measured.
 
+## Fan-out: 1 vs 4 consumers
+
+Same 500-key flood at ~3.7k writes/sec on separate VMs (matrix legs), both 100% DB success:
+
+| Eaters | Each applied | Backlog mid-run | Backlog end |
+|---|---|---|---|
+| 1 | 109,999 (all) | 29–98, never cleared | drained |
+| 4 | ~27.5k each, even split | drained to 0 by t+30s | 0 |
+
+DB P99 identical (35 vs 37ms) — eaters live downstream of commits and can't
+speed them up. The sharing shows in the backlog: one eater treaded water the
+whole run (near its ~3.7k/s ceiling), four drained dry. Per-consumer counts
+come from `cdc:stats:<group>` (one `HINCRBY` per batch). `Bench-fanout`
+workflow, `consumers: [1, 4]` matrix.
+
 ## Chaos tests
 
 - **Mixed load** (1k writes/s + 500 redis ops/s): DB 100%, coexistence clean.
