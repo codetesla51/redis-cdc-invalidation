@@ -121,45 +121,52 @@ The dashboard's `changes_processed` ticks up once per write, and the next `getPr
 | `MODE` | `direct` | Topology: `direct` (phylax straight to pools), `produce` (phylax appends to `STREAM`), `consume` (group worker drains `STREAM` into `DEL`s). |
 | `STREAM` | `cdc` | Stream key for produce/consume modes. |
 | `GROUP` | `invalidators` | Consumer group workers share; each entry delivered to exactly one worker, `ACK`ed only after its `DEL`. |
+| `PUBLISH_QUEUE_SIZE` | `100000` | Producer queue capacity in `produce` mode. A full queue drops entries loudly rather than stalling WAL processing. |
 
 ## Scaling out with streams
 
-One slot serves one consumer, so plain `direct` mode can't share load: three boxes would each eat every change. `MODE=produce` turns phylax into a stream producer (`XADD cdc * table op id` per change); any number of `MODE=consume` boxes in `GROUP` split the entries (`XREADGROUP`), `DEL`, `XACK`. Unacked entries stay pending for redelivery — at-least-once without the slot. Out-of-order delivery across consumers is harmless: `DEL` is idempotent.
+`direct` mode is the simple single-process path: phylax hashes each row ID to one of the local worker pools and each pool keeps per-key order. It cannot share work across boxes because every process would read the same logical slot and receive every change.
+
+`MODE=produce` splits that path in two:
+
+```mermaid
+flowchart LR
+    PG[(Postgres\nWAL slot)] --> PRODUCER[phylax\nproducer]
+    PRODUCER -->|XADD batch| STREAM[(Redis stream\ncdc)]
+    STREAM -->|XREADGROUP| C1[consumer 1]
+    STREAM -->|XREADGROUP| C2[consumer 2]
+    STREAM -->|XREADGROUP| CN[consumer N]
+    C1 -->|DEL + XACK| REDIS[(Redis cache)]
+    C2 -->|DEL + XACK| REDIS
+    CN -->|DEL + XACK| REDIS
+```
+
+Consumers in the same `GROUP` share the stream. Redis gives each entry to one consumer, the consumer deletes the cache key, and only then acknowledges the entry. Unacknowledged entries remain pending for redelivery, so the delivery contract is at-least-once. `DEL` is idempotent, so replay and out-of-order delivery are harmless.
 
 ```sh
-# box 1: WAL → stream
+# box 1: Postgres WAL → stream
 DATABASE_URL='...' TABLES='products' MODE=produce /tmp/opencode/cdc-load
-# boxes 2..N: stream → DEL
-MODE=consume /tmp/opencode/cdc-load
+
+# boxes 2..N: stream → Redis DEL
+MODE=consume STREAM=cdc GROUP=invalidators /tmp/opencode/cdc-load
 ```
 
-Proven live: one insert → key gone, group backlog empty.
+The producer batches `XADD`s every 10ms and each consumer records applied counts in `cdc:stats:<group>`. The count is a benchmark/health signal, not part of correctness.
 
-Example — three terminals. Terminal 1, the writer (needs the DB):
+### What fan-out has been proven to do
 
-```sh
-DATABASE_URL='postgres://postgres@localhost:5432/redis_cdc' TABLES='products' MODE=produce /tmp/opencode/cdc-load
-```
+A 30-second, 500-key flood at roughly 3.7k writes/sec produced 110,000 successful writes on both legs:
 
-Terminal 2, an eater (needs only Valkey — no Postgres credentials):
+| Consumers | Work distribution | Group backlog |
+|---|---|---|
+| 1 | 109,999 invalidations handled by the one worker | 29–98 during the run, then drained |
+| 4 | About 27,500 per worker, evenly split | Drained to 0 during the run |
 
-```sh
-MODE=consume /tmp/opencode/cdc-load
-# consuming cdc as invalidators/uthman-210895
-```
+Database P99 stayed effectively unchanged (35ms vs 37ms). More consumers improve the invalidation stage's ability to keep up; they do not make Postgres commits faster. This proves the sharing mechanism from 1 to 4 consumers, not an unlimited 10,000-consumer capacity.
 
-Terminal 3, the proof. Seed a stale cached key, write the row, watch it die:
+### Local proof
 
-```sh
-valkey-cli SET products:demobox stale
-psql -h localhost -U postgres -d redis_cdc \
-  -c "INSERT INTO products (id, name) VALUES ('demobox','book');"
-valkey-cli EXISTS products:demobox  # 0 — gone
-valkey-cli XRANGE cdc - +           # the note: table products, op insert, id demobox
-valkey-cli XPENDING cdc invalidators # empty — every entry ACKed
-```
-
-Add more Terminal-2 boxes to split the load; each entry reaches exactly one of them.
+One insert still goes through the complete path: key gone, stream entry present, group backlog empty. The full benchmark record is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Monitoring
 
@@ -192,7 +199,7 @@ Pure unit tests (hash stability, cross-key spread, same-key ordering under `-rac
 - **Slot lag.** While this process is stopped, WAL accumulates in `my_slot`. Alert on slot growth, or restarts replay a mountain.
 - **Hot keys.** After `DEL` on a very hot key, concurrent reads can stampede Postgres to repopulate. `singleflight` in `Store.Get` already collapses same-key misses into one flight (measured: 30-reader wall 50ms → 7.6ms); if a key outgrows even that, shorten its TTL or recompute it.
 - **At-least-once delivery.** Restarts replay unacknowledged changes. `DEL` is idempotent so replays are harmless — keep any future handlers idempotent too.
-- **Shutdown.** Ctrl-C (SIGINT) stops replication and the console gracefully. Plain `kill` (SIGTERM) terminates without the graceful path. Also note: `kill %1` won't stop a `go run` child in scripts — kill the `exe/pkg` PID.
+- **Shutdown.** Both SIGINT (Ctrl-C) and SIGTERM (`kill`) stop replication and the console gracefully. Note that `kill %1` won't stop a `go run` child in scripts; kill the `exe/pkg` PID.
 - **Key format.** Keys are `products:p1`, not `product:p1`. Don't mix binaries across the rename.
 
 ## Project layout
